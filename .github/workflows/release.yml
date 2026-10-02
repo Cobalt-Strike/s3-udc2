@@ -1,0 +1,141 @@
+on:
+  push:
+    tags:
+      - "v*"
+
+name: Create Release
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+
+          - runs_on: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+
+          - runs_on: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            suffix: windows-x64
+
+          - runs_on: macos-26
+            target: aarch64-apple-darwin
+            suffix: macos-arm64
+
+    runs-on: ${{ matrix.runs_on }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@master
+
+      - name: Install cross-compilation toolchains (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt update
+          pkgs=(mingw-w64)
+          if [ "${{ matrix.suffix}}" = "linux-arm64" ]; then
+            pkgs+=(gcc-aarch64-linux-gnu)
+          fi
+          sudo apt install -y "${pkgs[@]}"
+
+      - name: Install cross-compilation toolchains (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -eux
+          brew update
+          brew install mingw-w64
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Set cross-compilation linkers
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          fi
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          fi
+
+      - name: Build and package ${{ matrix.suffix }}
+        shell: bash
+        run: |
+          set -eux
+          cargo build --release --verbose --target "${{ matrix.target }}"
+          mkdir -p dist
+
+          package_target () {
+            local TARGET="$1"
+            local SUFFIX="$2"
+            local EXE="$3"
+
+            mkdir -p "dist/s3-udc2-${SUFFIX}/bofs"
+
+            cp "target/${TARGET}/release/s3-udc2-relay${EXE}"   "dist/s3-udc2-${SUFFIX}/"
+            cp "target/${TARGET}/release/s3-udc2-presign${EXE}" "dist/s3-udc2-${SUFFIX}/"
+
+            cp s3-udc2-bof/bofs/s3-udc2-patchable* "dist/s3-udc2-${SUFFIX}/bofs/"
+            cp s3-udc2-bof/bofs/s3-udc2-migrate*   "dist/s3-udc2-${SUFFIX}/bofs/"
+            cp s3-udc2-bof/s3-udc2.cna             "dist/s3-udc2-${SUFFIX}/"
+
+            cp infra.tf  "dist/s3-udc2-${SUFFIX}/"
+            cp README.md "dist/s3-udc2-${SUFFIX}/"
+
+            (cd dist && tar -czf "s3-udc2-${SUFFIX}-${GITHUB_REF_NAME}.tar.gz" "s3-udc2-${SUFFIX}")
+          }
+
+          package_target "${{ matrix.target }}" "${{ matrix.suffix }}" "${{ startsWith(matrix.suffix, 'windows-') && '.exe' || '' }}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-udc2-${{ matrix.suffix }}
+          path: dist/s3-udc2-${{ matrix.suffix }}-${{ github.ref_name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@master
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          set -eux
+          ls -la dist
+          ls -la dist/*.tar.gz
+
+      - name: Create Release with all assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz
