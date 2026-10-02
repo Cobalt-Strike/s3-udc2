@@ -1,0 +1,24 @@
+architecture-beta
+  group victim(aws:arch-category-end-user-computing)[Victim]
+    service beacon(aws:res-aws-waf-bot)[Beacon] in victim
+
+  group awscloud(cloud)[AWS Cloud]
+    group region(aws:region)[Region] in awscloud
+      group s3bucket(aws:arch-amazon-simple-storage-service)[S3 Bucket] in region
+        service c2s(aws:res-amazon-simple-storage-service-object)[Beacon to TS Frame] in s3bucket
+        service s2c(aws:res-amazon-simple-storage-service-object)[TS to Beacon Frame] in s3bucket
+
+        beacon:T -[PostObject]-> L:c2s{group}
+        beacon:R <-[GetObject]- L:s2c{group}
+
+      service sqs(aws:arch-amazon-simple-queue-service)[SQS] in region
+      c2s:R -[ObjectCreated]-> L:sqs
+
+  group cs(aws:res-servers)[Cobalt Strike]
+    service udc2listener(aws:res-server)[Team Server] in cs
+    service udc2relay(aws:res-sdk)[S3 UDC2 Relay] in cs
+
+    udc2listener:L <-[Frames]-> R:udc2relay
+    sqs:R <-[Listen Events]- T:udc2relay{group}
+    s2c{group}:R <-[PutObject]- L:udc2relay
+    c2s:R -[GetObject]-> L:udc2relay

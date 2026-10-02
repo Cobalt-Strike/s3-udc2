@@ -1,0 +1,49 @@
+CFLAGS=/c /GS- /std:c++20
+DEBUGCFLAGS=/Zi /MTd /D_DEBUG /EHsc /std:c++20
+
+!IFDEF UDC2_DEBUG_HOST
+DEBUGCFLAGS=$(DEBUGCFLAGS) /DUDC2_DEBUG_HOST="$(UDC2_DEBUG_HOST)"
+!ENDIF
+
+!IFNDEF PLATFORM
+PLATFORM=$(PROCESSOR_ARCHITECTURE)
+!ENDIF
+
+!IF "$(PLATFORM)" != "x86" && "$(PLATFORM)" != "AMD64"
+!ERROR Only x86 and AMD64 architectures are supported or the PLATFORM environment variable is not set.
+!ELSEIF "$(PLATFORM)" == "AMD64"
+OUTDIR=bofs\ 
+IMDIR=build\x64\Release\ 
+DOUTDIR=build\x64\Debug\ 
+DIMDIR=build\x64\Debug\ 
+OUTEXT=.x64.o
+!ELSE
+OUTDIR=bofs\ 
+IMDIR=build\x86\Release\ 
+DIMDIR=build\x86\Debug\ 
+DOUTDIR=build\x86\Debug\ 
+OUTEXT=.x86.o
+!ENDIF
+
+all: *.cpp
+    @$(MAKE) /F Makefile.win /A $(patsubst %.c,%.obj, $(patsubst %.cpp, %.obj, $(patsubsti %, $(IMDIR)\%, $**))) PLATFORM=$(PLATFORM)
+    @if not exist "$(OUTDIR)" mkdir "$(OUTDIR)"
+    copy "$(IMDIR)\*.obj" "$(OUTDIR)"
+    del /F "$(OUTDIR)\*$(OUTEXT)"
+    ren "$(OUTDIR)*.obj" "*$(OUTEXT)"
+
+all-debug: *.cpp
+    @$(MAKE) /F Makefile.win /A $(patsubst %.c,%.exe, $(patsubst %.cpp, %.exe, $(patsubsti %, $(DOUTDIR)\%, $**))) PLATFORM=$(PLATFORM)
+
+.cpp{$(IMDIR)}.obj:
+    @if not exist "$(IMDIR)" mkdir "$(IMDIR)"
+    $(CPP) $(CFLAGS) /Fo"$@" $<
+
+.cpp{$(DOUTDIR)}.exe:
+    @if not exist "$(DIMDIR)" mkdir "$(DIMDIR)"
+    @if not exist "$(DOUTDIR)" mkdir "$(DOUTDIR)"
+    $(CPP) $(DEBUGCFLAGS) /Fo$(DIMDIR) /Fd$(DIMDIR) /Fe"$@" $< base/mock.cpp base/debug.cpp
+
+clean:
+     @if exist "build" rmdir /Q /S "build"
+     @if exist "bofs" rmdir /Q /S "bofs"
