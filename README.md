@@ -10,7 +10,7 @@ AWS S3-backed [User-Defined C2](https://hstechdocs.helpsystems.com/manuals/cobal
 - Hot-swappable runtime configuration: migrate Beacon to use another S3 bucket.
 - Configuration patching during listener creation: add new listeners without
   re-compiling the UDC2 BOF.
-- Cobalt Strike GUI and console integartion.
+- Cobalt Strike GUI and console integration.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ This section shows the minimum steps to get s3-udc2 running. For more details, s
 2. Extract it to a directory of your choice:
 
 ```bash
-tar -xvf s3-udc2-linux-amd64-v1.0.0.tar.gz
+tar -xvf s3-udc2-linux-amd64-v1.0.1.tar.gz
 cd s3-udc2-linux-amd64
 ```
 
